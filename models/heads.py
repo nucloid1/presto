@@ -1636,6 +1636,30 @@ class ExcisionHead(nn.Module):
         index = window_idx.unsqueeze(1).unsqueeze(-1).expand(batch, n_cond, window, 1)
         return expanded.gather(3, index).squeeze(-1).sum(dim=2)
 
+    @staticmethod
+    def _window_preference_soft(
+        profile: torch.Tensor, weights: torch.Tensor, window_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """Mixture over conditions: `(batch, n_cond)` weights -> `(batch,)`.
+
+        The categorical path asks "which state is this cell in". Expression data
+        answers a different question: immunoproteasome subunit ratio, TAP level
+        and ERAP level are continuous, and a cell at 40% immunoproteasome is not
+        any of the discrete labels. Indexing forces a rounding decision the data
+        does not support, and cannot extrapolate to a state never seen as a label.
+
+        Implemented as a weighted sum of `_window_preference_all` rather than by
+        mixing the tables first. Both are algebraically identical because the
+        window sum is linear in the profile, but routing through the panel
+        function makes it *structurally* impossible for the scalar and the
+        counterfactual panel to disagree -- the failure this file's comments
+        record having shipped once already.
+
+        With one-hot weights this reduces exactly to `_window_preference`, which
+        `tests/test_excision_continuous_apm.py` asserts.
+        """
+        return (ExcisionHead._window_preference_all(profile, window_idx) * weights).sum(dim=1)
+
     def _junction_score(
         self,
         profile: torch.Tensor,
@@ -1670,6 +1694,13 @@ class ExcisionHead(nn.Module):
         peptide_source_idx: Optional[torch.Tensor] = None,
         processing_stimulus_idx: Optional[torch.Tensor] = None,
         apm_perturbation_idx: Optional[torch.Tensor] = None,
+        # Continuous alternatives to the two indices above, each (batch, n_cond)
+        # over the same vocabulary. Supplied from expression -- immunoproteasome
+        # subunit ratio, TAP level, ERAP level -- rather than from a curated
+        # label. When present they take precedence; when absent behaviour is
+        # exactly the categorical path, so existing checkpoints are unaffected.
+        apm_weights: Optional[torch.Tensor] = None,
+        stimulus_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         machinery_idx = machinery_idx.long()
         rows = torch.arange(machinery_idx.shape[0], device=machinery_idx.device)
@@ -1742,12 +1773,26 @@ class ExcisionHead(nn.Module):
         # making the whole junction unrepresentable.
         window_c = self._resolve_window(window_c_idx, p1_c_idx, p1_prime_c_idx)
         window_n = self._resolve_window(window_n_idx, p1_n_idx, p1_prime_n_idx)
+        # One resolver per axis, so every downstream use -- the scalar, the bias
+        # and both counterfactual panels -- reads the observed contribution the
+        # same way. Splitting the soft and hard paths at each use site is how
+        # the panel and the scalar drift apart.
+        def _apm_observed(profile: torch.Tensor, window: torch.Tensor) -> torch.Tensor:
+            if apm_weights is None:
+                return self._window_preference(profile, apm, window)
+            return self._window_preference_soft(profile, apm_weights, window)
+
+        def _stimulus_observed(profile: torch.Tensor, window: torch.Tensor) -> torch.Tensor:
+            if stimulus_weights is None:
+                return self._window_preference(profile, stimulus, window)
+            return self._window_preference_soft(profile, stimulus_weights, window)
+
         invivo_c = (
-            self._window_preference(self.invivo_profile_c, apm, window_c)
-            + self._window_preference(self.stimulus_profile_c, stimulus, window_c)
+            _apm_observed(self.invivo_profile_c, window_c)
+            + _stimulus_observed(self.stimulus_profile_c, window_c)
             + context_c
         )
-        invivo_n = self._window_preference(self.invivo_profile_n, apm, window_n) + context_n
+        invivo_n = _apm_observed(self.invivo_profile_n, window_n) + context_n
 
         c_terminus_score = is_protein * c_terminus_score + is_mhc * invivo_c
         n_terminus_score = is_protein * n_terminus_score + is_mhc * invivo_n
@@ -1759,7 +1804,12 @@ class ExcisionHead(nn.Module):
         # for MHC selection, so the in-vivo branch contributes no length term.
         length_score = is_protein * length_score
 
-        bias = is_protein * self.bias[machinery_idx] + is_mhc * self.invivo_bias[apm]
+        invivo_bias_observed = (
+            self.invivo_bias[apm]
+            if apm_weights is None
+            else (self.invivo_bias.unsqueeze(0) * apm_weights).sum(dim=1)
+        )
+        bias = is_protein * self.bias[machinery_idx] + is_mhc * invivo_bias_observed
         logit = n_terminus_score + c_terminus_score + length_score + missed_cleavage_score + bias
 
         # Counterfactual tracks: the excision logit this peptide would show
@@ -1785,17 +1835,24 @@ class ExcisionHead(nn.Module):
         # matching `excision_logit` -- which is the column the panel loss
         # gathers, so the supervision would target a quantity the model never
         # reports. That bug has shipped here once already.
+        # Each panel swaps the OBSERVED contribution for each candidate's. With
+        # a categorical state the observed column reproduces `excision_logit`
+        # exactly, which the panel loss depends on. With continuous weights
+        # there is no single observed column -- the cell is a mixture -- so the
+        # panel keeps its own meaning ("what would a cell purely in state k
+        # show") while the subtracted term is the mixture actually used. A
+        # one-hot weight vector recovers the categorical behaviour exactly.
         apm_panel = logit.unsqueeze(1) + not_protein.unsqueeze(1) * (
             self._window_preference_all(self.invivo_profile_c, window_c)
-            - self._window_preference(self.invivo_profile_c, apm, window_c).unsqueeze(1)
+            - _apm_observed(self.invivo_profile_c, window_c).unsqueeze(1)
             + self._window_preference_all(self.invivo_profile_n, window_n)
-            - self._window_preference(self.invivo_profile_n, apm, window_n).unsqueeze(1)
+            - _apm_observed(self.invivo_profile_n, window_n).unsqueeze(1)
             + self.invivo_bias.unsqueeze(0)
-            - self.invivo_bias[apm].unsqueeze(1)
+            - invivo_bias_observed.unsqueeze(1)
         )
         stimulus_panel = logit.unsqueeze(1) + not_protein.unsqueeze(1) * (
             self._window_preference_all(self.stimulus_profile_c, window_c)
-            - self._window_preference(self.stimulus_profile_c, stimulus, window_c).unsqueeze(1)
+            - _stimulus_observed(self.stimulus_profile_c, window_c).unsqueeze(1)
         )
         return {
             "excision_panel_apm": apm_panel,
