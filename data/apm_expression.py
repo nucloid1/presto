@@ -23,6 +23,32 @@ shipped defaults 90% of lines put >0.8 on `none`, and an in-silico knockout of
 `peptide_supply`, `n_term_trimming`, `loading_complex` or `mhc_null` drives its
 own axis to 0.73-1.00 while every other axis moves by exactly 0.00.
 
+Validated against genotype, which the layer never sees. Cross-referencing
+DepMap's damaging-mutation matrix over 1,597 lines with both data types:
+
+    axis                n dmg   mean w dmg   mean w wt      p (MWU)
+    mhc_null               28        0.321       0.019      1.0e-22
+    n_term_trimming        15        0.044       0.016      9.5e-03
+    peptide_supply         14        0.022       0.014      0.17
+    loading_complex        12        0.001       0.005      0.14
+    class_ii_loading       21        0.014       0.008      0.53
+
+B2M is the decisive case and it is overwhelming: 36% of B2M-damaged lines
+exceed a weight of 0.3 on `mhc_null` against 2% of wild-type lines, a
+seventeen-fold enrichment, from expression alone.
+
+The pattern across axes is exactly what the mechanism predicts rather than
+what one would hope. A damaging mutation is only visible here when it lowers
+the transcript -- nonsense and frameshift alleles trigger nonsense-mediated
+decay, missense alleles do not. So the layer is **specific but not sensitive**:
+it rarely calls a perturbation that is not there (2% of wild-type lines), and
+it misses the majority of damaging mutations because most leave mRNA intact.
+
+For this use specificity is the property that matters, since a false
+perturbation call corrupts the state vector for a cell that is actually
+normal. But a low weight is never evidence a component is intact, and the
+remaining axes are underpowered at n = 12-21 damaged lines regardless.
+
 **Known limitation: `class_ii_loading` is weakly detected**, reaching only ~0.16
 on a full in-silico knockout even in a B-cell line expressing all six genes.
 Class-II loading genes vary far more widely among the cells that use them than
